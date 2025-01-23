@@ -577,6 +577,9 @@ type smbChunkWriter struct {
 	src       fs.ObjectInfo
 	share     string
 	filename  string
+
+	poolMu sync.Mutex
+	pool   []*smbChunkWriterFile
 }
 
 // OpenChunkWriter returns the chunk size and a ChunkWriter
@@ -657,25 +660,11 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 
 // WriteChunk will write chunk number with reader bytes, where chunk number >= 0
 func (w *smbChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader io.ReadSeeker) (n int64, err error) {
-	w.f.addSession() // Show session in use
-	defer w.f.removeSession()
-
-	cn, err := w.f.getConnection(ctx, w.share)
-	if err != nil {
-		return 0, err
-	}
-	defer w.f.putConnection(&cn, err)
-
-	fl, err := cn.smbShare.OpenFile(w.filename, os.O_WRONLY, 0o644)
+	fl, err := w.getFile(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("failed to open: %w", err)
 	}
-	defer func() {
-		cErr := fl.Close()
-		if cErr != nil {
-			err = errors.Join(err, fmt.Errorf("failed to close: %w", cErr))
-		}
-	}()
+	defer w.putFile(&fl, err)
 
 	_, err = fl.Seek(int64(chunkNumber)*w.chunkSize, io.SeekStart)
 	if err != nil {
@@ -694,17 +683,36 @@ func (w *smbChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader
 func (w *smbChunkWriter) Abort(ctx context.Context) error {
 	fs.Debugf(w.o, "multipart upload aborted - removing file")
 
-	return w.o.Remove(ctx)
+	var errs []error
+	if err := w.drainPool(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("failed to drain file pool: %w", err))
+	}
+	if err := w.o.Remove(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("failed to remove file: %w", err))
+	}
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+
+	return nil
 }
 
 // Close and finalise the multipart upload
 func (w *smbChunkWriter) Close(ctx context.Context) (err error) {
-	err = w.o.SetModTime(ctx, w.src.ModTime(ctx))
-	if err != nil {
-		return fmt.Errorf("Update SetModTime failed: %w", err)
+	fs.Debugf(w.o, "multipart upload finished - setting modtime")
+
+	var errs []error
+	if err := w.drainPool(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("failed to drain file pool: %w", err))
+	}
+	if err := w.o.SetModTime(ctx, w.src.ModTime(ctx)); err != nil {
+		errs = append(errs, fmt.Errorf("failed to set modtime: %w", err))
 	}
 
-	fs.Debugf(w.o, "multipart upload finished")
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
 
 	return nil
 }
