@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/rclone/rclone/fs"
@@ -284,7 +285,9 @@ func multiThreadCopy(ctx context.Context, f fs.Fs, remote string, src fs.Object,
 type writerAtChunkWriter struct {
 	remote          string
 	size            int64
-	writerAt        fs.WriterAtCloser
+	openWriterAt    fs.OpenWriterAtFn
+	writerAtPool    []fs.WriterAtCloser
+	writerAtPoolMu  sync.Mutex
 	chunkSize       int64
 	chunks          int
 	writeBufferSize int64
@@ -293,7 +296,7 @@ type writerAtChunkWriter struct {
 }
 
 // WriteChunk writes chunkNumber from reader
-func (w *writerAtChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader io.ReadSeeker) (int64, error) {
+func (w *writerAtChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader io.ReadSeeker) (n int64, err error) {
 	fs.Debugf(w.remote, "writing chunk %v", chunkNumber)
 
 	bytesToWrite := w.chunkSize
@@ -301,11 +304,18 @@ func (w *writerAtChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, r
 		bytesToWrite = w.size % w.chunkSize
 	}
 
-	var writer io.Writer = io.NewOffsetWriter(w.writerAt, int64(chunkNumber)*w.chunkSize)
+	var writerAt fs.WriterAtCloser
+	writerAt, err = w.getWriterAt(ctx)
+	if err != nil {
+		return -1, fmt.Errorf("multi-thread copy: failed to get writer: %w", err)
+	}
+	defer w.putWriterAt(&writerAt, err)
+
+	var writer io.Writer = io.NewOffsetWriter(writerAt, int64(chunkNumber)*w.chunkSize)
 	if w.writeBufferSize > 0 {
 		writer = bufio.NewWriterSize(writer, int(w.writeBufferSize))
 	}
-	n, err := io.Copy(writer, reader)
+	n, err = io.Copy(writer, reader)
 	if err != nil {
 		return -1, err
 	}
@@ -315,8 +325,8 @@ func (w *writerAtChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, r
 	// if we were buffering, flush to disk
 	switch w := writer.(type) {
 	case *bufio.Writer:
-		er2 := w.Flush()
-		if er2 != nil {
+		err = w.Flush()
+		if err != nil {
 			return -1, fmt.Errorf("multi-thread copy: flush failed: %w", err)
 		}
 	}
@@ -329,7 +339,7 @@ func (w *writerAtChunkWriter) Close(ctx context.Context) error {
 		return nil
 	}
 	w.closed = true
-	return w.writerAt.Close()
+	return w.drainWriterAtPool(ctx)
 }
 
 // Abort the chunk writing
@@ -345,6 +355,66 @@ func (w *writerAtChunkWriter) Abort(ctx context.Context) error {
 	return obj.Remove(ctx)
 }
 
+// getWriterAt gets a WriterAtCloser from the pool or opens a new one
+func (w *writerAtChunkWriter) getWriterAt(ctx context.Context) (fs.WriterAtCloser, error) {
+	w.writerAtPoolMu.Lock()
+	defer w.writerAtPoolMu.Unlock()
+
+	if len(w.writerAtPool) == 0 {
+		return w.openWriterAt(ctx, w.remote, w.size)
+	}
+
+	writerAt := w.writerAtPool[0]
+	w.writerAtPool = w.writerAtPool[1:]
+
+	return writerAt, nil
+}
+
+// putWriterAt puts a WriterAtCloser back into the pool
+// if err is not nil, it closes the WriterAtCloser and discards it
+func (w *writerAtChunkWriter) putWriterAt(pf *fs.WriterAtCloser, err error) {
+	if pf == nil {
+		return
+	}
+	f := *pf
+	if f == nil {
+		return
+	}
+	*pf = nil
+
+	if err != nil {
+		_ = f.Close()
+		return
+	}
+
+	w.writerAtPoolMu.Lock()
+	w.writerAtPool = append(w.writerAtPool, f)
+	w.writerAtPoolMu.Unlock()
+}
+
+// drainWriterAtPool closes all the writers in the pool
+func (w *writerAtChunkWriter) drainWriterAtPool(_ context.Context) error {
+	w.writerAtPoolMu.Lock()
+	defer w.writerAtPoolMu.Unlock()
+
+	if len(w.writerAtPool) == 0 {
+		return nil
+	}
+
+	// close all the writers in parallel
+	// we don't give a context to the errgroup to avoid stopping on the first error
+	var g errgroup.Group
+	for _, f := range w.writerAtPool {
+		g.Go(func() error {
+			return f.Close()
+		})
+	}
+	err := g.Wait()
+	w.writerAtPool = nil
+
+	return err
+}
+
 // openChunkWriterFromOpenWriterAt adapts an OpenWriterAtFn into an OpenChunkWriterFn using chunkSize and writeBufferSize
 func openChunkWriterFromOpenWriterAt(openWriterAt fs.OpenWriterAtFn, chunkSize int64, writeBufferSize int64, f fs.Fs) fs.OpenChunkWriterFn {
 	return func(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (info fs.ChunkWriterInfo, writer fs.ChunkWriter, err error) {
@@ -354,9 +424,23 @@ func openChunkWriterFromOpenWriterAt(openWriterAt fs.OpenWriterAtFn, chunkSize i
 		if err != nil {
 			return info, nil, err
 		}
+		defer func() {
+			cErr := writerAt.Close()
+			if cErr != nil {
+				err = errors.Join(err, fmt.Errorf("failed to close: %w", cErr))
+			}
+		}()
 
 		if writeBufferSize > 0 {
 			fs.Debugf(src.Remote(), "multi-thread copy: write buffer set to %v", writeBufferSize)
+		}
+
+		// preallocate the file to the correct size if possible
+		if src.Size() > 0 {
+			_, err = writerAt.WriteAt([]byte{0}, src.Size()-1)
+			if err != nil {
+				return info, nil, fmt.Errorf("multi-thread copy: failed to preallocate file: %w", err)
+			}
 		}
 
 		chunkWriter := &writerAtChunkWriter{
@@ -364,7 +448,7 @@ func openChunkWriterFromOpenWriterAt(openWriterAt fs.OpenWriterAtFn, chunkSize i
 			size:            src.Size(),
 			chunkSize:       chunkSize,
 			chunks:          calculateNumChunks(src.Size(), chunkSize),
-			writerAt:        writerAt,
+			openWriterAt:    openWriterAt,
 			writeBufferSize: writeBufferSize,
 			f:               f,
 		}
